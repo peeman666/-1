@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Warehouse & Shipment Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+<script type="importmap">
+{
+  "imports": {
+    "xlsx": "https://esm.sh/xlsx@^0.18.5",
+    "react": "https://esm.sh/react@^19.2.3",
+    "lucide-react": "https://esm.sh/lucide-react@^0.561.0",
+    "react/": "https://esm.sh/react@^19.2.3/"
+  }
+}
+</script>
+<link rel="stylesheet" href="./index.css">
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans antialiased">
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useMemo, useRef, useEffect } from 'https://esm.sh/react@18.2.0';
+        import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client';
+        import * as XLSX from 'https://cdn.sheetjs.com/xlsx-0.20.0/package/xlsx.mjs';
+        import { 
+            Upload, Image as ImageIcon, Trash2, Copy, Plus, FileSpreadsheet, 
+            X, Edit3, Save, ChevronDown, ChevronUp, AlertTriangle, Search, 
+            Edit2, Check, Truck, Box, Eye 
+        } from 'https://esm.sh/lucide-react@0.292.0';
+
+        // --- UTILS ---
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+
+        const parseStockExcel = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = e.target?.result;
+                        const workbook = XLSX.read(data, { type: 'binary' });
+                        const sheetName = workbook.SheetNames[0];
+                        const sheet = workbook.Sheets[sheetName];
+                        const jsonData = XLSX.utils.sheet_to_json(sheet);
+                        
+                        const parsedData = jsonData.map((row) => {
+                             const getNumber = (val) => {
+                                 if (val === undefined || val === null) return 0;
+                                 const parsed = parseFloat(String(val).trim());
+                                 return isNaN(parsed) ? 0 : parsed;
+                             };
+
+                             const name = (row['商品名称'] || row['Name'] || row['name'] || '').trim();
+                             if (!name) return null;
+
+                             return {
+                                 name,
+                                 price: getNumber(row['单价'] || row['Price'] || row['price']),
+                                 totalStock: getNumber(row['总库存'] || row['Total'] || row['total']),
+                                 shippedCount: getNumber(row['已发货数量'] || row['Shipped'] || row['shipped'] || row['已发货']),
+                                 remainingCount: getNumber(row['剩余数量'] || row['Remaining'] || row['remaining'] || row['余量'])
+                             };
+                        }).filter(item => item !== null);
+
+                        resolve(parsedData);
+                    } catch (err) {
+                        reject(err);
+                    }
+                };
+                reader.onerror = (err) => reject(err);
+                reader.readAsBinaryString(file);
+            });
+        };
+
+        const parseShipmentPaste = (text) => {
+            const normalizedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+            const rows = normalizedText.trim().split('\n');
+
+            return rows.map(row => {
+                let cells = row.split('\t');
+                if (cells.length === 1 && row.trim().length > 0) cells = [row.trim()];
+                if (cells.length === 0 || (cells.length === 1 && !cells[0].trim())) return null;
+
+                // Skip header if included
+                if (cells[1] && cells[1].includes("物品名称")) return null;
+
+                if (cells.length >= 12) {
+                    const rawItemName = (cells[1] || '').trim();
+                    if (!rawItemName) return null;
+                    const qty = parseInt(cells[2] || '1', 10);
+                    return {
+                        rawItemName: rawItemName,
+                        quantity: isNaN(qty) ? 1 : qty,
+                        receiverName: (cells[10] || '').trim(),
+                        receiverPhone: (cells[11] || '').trim(),
+                        receiverAddress: (cells[13] || '').trim(),
+                        notes: (cells[14] || '').trim()
+                    };
+                } else {
+                    const rawItemName = (cells[0] || '').trim();
+                    if (!rawItemName) return null;
+                    return {
+                        rawItemName: rawItemName,
+                        quantity: parseInt(cells[1] || '1', 10),
+                        receiverName: '',
+                        receiverPhone: (cells[2] || '').trim(),
+                        receiverAddress: (cells[3] || '').trim(),
+                        notes: (cells[4] || '').trim()
+                    };
+                }
+            }).filter(item => item !== null);
+        };
+
+        const copyToClipboard = async (text) => {
+            try {
+                await navigator.clipboard.writeText(text);
+                return true;
+            } catch (err) {
+                console.error('Failed to copy', err);
+                return false;
+            }
+        };
+
+        // --- COMPONENTS ---
+
+        const WarehouseTab = ({ 
+            products, 
+            stockFiles, 
+            setStockFiles, 
+            manualAdjustments,
+            setManualAdjustments,
+            addApplication,
+            onRenameProduct
+        }) => {
+            const fileInputRef = useRef(null);
+            const [editingProduct, setEditingProduct] = useState(null);
+            const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+
+            const [channel, setChannel] = useState('');
+            const [activityName, setActivityName] = useState('');
+            const [docLink, setDocLink] = useState('');
+            const [currentRewardId, setCurrentRewardId] = useState('');
+            const [currentRewardQty, setCurrentRewardQty] = useState('');
+            const [selectedRewards, setSelectedRewards] = useState([]);
+            const [rewardSearch, setRewardSearch] = useState('');
+
+            const handleFileUpload = async (e) => {
+                if (e.target.files && e.target.files[0]) {
+                    const file = e.target.files[0];
+                    try {
+                        const rawData = await parseStockExcel(file);
+                        const newFile = {
+                            id: generateId(),
+                            name: file.name,
+                            data: rawData,
+                            uploadedAt: Date.now()
+                        };
+                        setStockFiles(prev => [...prev, newFile]);
+                        if (fileInputRef.current) fileInputRef.current.value = '';
+                    } catch (error) {
+                        alert('解析Excel失败，请检查格式');
+                        console.error(error);
+                    }
+                }
+            };
+
+            const removeFile = (id) => {
+                if (window.confirm('确定要移除这个导入的文件吗？\n\n移除后，该文件中的所有商品库存将从仓库中扣除。')) {
+                    setStockFiles(prev => prev.filter(f => f.id !== id));
+                }
+            };
+
+            const openEditModal = (product) => {
+                if (product) {
+                    const existing = manualAdjustments.find(m => m.name === product.name);
+                    setEditingProduct(existing || {
+                        name: product.name,
+                        originalName: product.name,
+                        price: product.price,
+                        totalStockOffset: 0,
+                        remainingCountOffset: 0,
+                        imageUrl: product.imageUrl
+                    });
+                    if (existing) {
+                        setEditingProduct(prev => ({ ...prev, originalName: product.name }));
+                    }
+                } else {
+                    setEditingProduct({
+                        name: '',
+                        price: 0,
+                        totalStockOffset: 0,
+                        remainingCountOffset: 0
+                    });
+                }
+                setIsEditModalOpen(true);
+            };
+
+            const handleSaveEdit = () => {
+                if (!editingProduct || !editingProduct.name) return;
+                
+                if (editingProduct.originalName && editingProduct.name !== editingProduct.originalName) {
+                    onRenameProduct(editingProduct.originalName, editingProduct.name);
+                }
+
+                setManualAdjustments(prev => {
+                    const others = prev.filter(m => m.name !== editingProduct.name && m.name !== editingProduct.originalName);
+                    const newAdjustment = {
+                        productId: generateId(),
+                        name: editingProduct.name,
+                        price: editingProduct.price,
+                        totalStockOffset: editingProduct.totalStockOffset || 0,
+                        remainingCountOffset: editingProduct.remainingCountOffset || 0,
+                        imageUrl: editingProduct.imageUrl
+                    };
+                    return [...others, newAdjustment];
+                });
+
+                setIsEditModalOpen(false);
+                setEditingProduct(null);
+            };
+
+            const handleImageUpload = (productName, file) => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    const result = e.target?.result;
+                    setManualAdjustments(prev => {
+                        const existing = prev.find(m => m.name === productName);
+                        const others = prev.filter(m => m.name !== productName);
+                        const updated = existing 
+                            ? { ...existing, imageUrl: result } 
+                            : { productId: generateId(), name: productName, totalStockOffset: 0, remainingCountOffset: 0, imageUrl: result };
+                        return [...others, updated];
+                    });
+                };
+                reader.readAsDataURL(file);
+            };
+
+            const sortedProducts = useMemo(() => {
+                return [...products].sort((a, b) => a.price - b.price);
+            }, [products]);
+
+            const handleAddReward = () => {
+                if (!currentRewardId || !currentRewardQty || Number(currentRewardQty) <= 0) return;
+                
+                const product = products.find(p => p.id === currentRewardId);
+                if (!product) return;
+
+                const alreadyInForm = selectedRewards.find(r => r.productId === product.id)?.applyQty || 0;
+                const qty = Number(currentRewardQty);
+
+                if (product.remainingCount < (alreadyInForm + qty)) {
+                    alert(`库存不足！商品 "${product.name}" 剩余: ${product.remainingCount}, 当前申请累计: ${alreadyInForm + qty}`);
+                    return;
+                }
+
+                setSelectedRewards(prev => {
+                    const existing = prev.find(r => r.productId === currentRewardId);
+                    if (existing) {
+                        return prev.map(r => r.productId === currentRewardId ? { ...r, applyQty: r.applyQty + qty } : r);
+                    }
+                    return [...prev, {
+                        productId: product.id,
+                        productName: product.name,
+                        price: product.price,
+                        applyQty: qty
+                    }];
+                });
+
+                setCurrentRewardId('');
+                setCurrentRewardQty('');
+                setRewardSearch('');
+            };
+
+            const removeReward = (productId) => {
+                setSelectedRewards(prev => prev.filter(r => r.productId !== productId));
+            };
+
+            const calculateTotalValue = () => {
+                return selectedRewards.reduce((sum, item) => sum + (item.price * item.applyQty), 0);
+            };
+
+            const handleCopyValueTable = () => {
+                let text = "商品名称\t单价\t申请数量\t小计\n";
+                selectedRewards.forEach(r => {
+                    text += `${r.productName}\t${r.price}\t${r.applyQty}\t${r.price * r.applyQty}\n`;
+                });
+                text += `总价值\t\t\t${calculateTotalValue()}`;
+                copyToClipboard(text).then(() => alert('奖励价值表已复制到剪贴板'));
+            };
+
+            const handleSubmitApplication = () => {
+                const errors = [];
+                if (!channel) errors.push("渠道名称");
+                if (!activityName) errors.push("活动名称");
+                if (!docLink) errors.push("活动方案文档");
+                if (selectedRewards.length === 0) errors.push("申请奖励");
+
+                if (errors.length > 0) {
+                    alert(`请填写完整信息，缺少: ${errors.join(', ')}`);
+                    return;
+                }
+
+                for (const reward of selectedRewards) {
+                    const product = products.find(p => p.id === reward.productId);
+                    if (!product || product.remainingCount < reward.applyQty) {
+                        alert(`提交失败：${reward.productName} 库存不足`);
+                        return;
+                    }
+                }
+
+                const newApp = {
+                    id: generateId(),
+                    channel,
+                    activityName,
+                    docLink,
+                    rewards: selectedRewards,
+                    shipmentDetails: [], 
+                    outboundOrderNo: '',
+                    createdAt: Date.now()
+                };
+
+                addApplication(newApp);
+                setChannel('');
+                setActivityName('');
+                setDocLink('');
+                setSelectedRewards([]);
+                alert('申请提交成功');
+            };
+
+            const filteredRewardOptions = sortedProducts.filter(p => 
+                p.name.toLowerCase().includes(rewardSearch.toLowerCase())
+            );
+
+            return (
+                <div className="grid grid-cols-12 gap-6 h-full relative">
+                    {/* Edit Modal */}
+                    {isEditModalOpen && editingProduct && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center">
+                            <div className="bg-white rounded-lg p-6 w-96 shadow-xl relative z-[60]">
+                                <h3 className="text-lg font-bold mb-4 text-gray-900">编辑/手动商品</h3>
+                                <div className="space-y-3">
+                                    <div>
+                                        <label className="block text-xs text-gray-500">商品名称</label>
+                                        <input type="text" className="w-full border p-2 rounded bg-white text-gray-900" value={editingProduct.name} onChange={e => setEditingProduct({...editingProduct, name: e.target.value})} />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-500">单价</label>
+                                        <input type="number" className="w-full border p-2 rounded bg-white text-gray-900" value={editingProduct.price} onChange={e => setEditingProduct({...editingProduct, price: parseFloat(e.target.value)})} />
+                                    </div>
+                                    <div className="p-2 bg-yellow-50 rounded border border-yellow-200">
+                                        <p className="text-xs text-yellow-700 mb-2 font-bold">手动库存调整</p>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <div>
+                                                <label className="block text-xs text-gray-500">总库存调整</label>
+                                                <input type="number" className="w-full border p-2 rounded bg-white text-gray-900" placeholder="+/-" value={editingProduct.totalStockOffset} onChange={e => setEditingProduct({...editingProduct, totalStockOffset: parseFloat(e.target.value) || 0})} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs text-gray-500">剩余数量调整</label>
+                                                <input type="number" className="w-full border p-2 rounded bg-white text-gray-900" placeholder="+/-" value={editingProduct.remainingCountOffset} onChange={e => setEditingProduct({...editingProduct, remainingCountOffset: parseFloat(e.target.value) || 0})} />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="flex justify-end mt-6 space-x-2">
+                                    <button onClick={() => setIsEditModalOpen(false)} className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded">取消</button>
+                                    <button onClick={handleSaveEdit} className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">保存</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="col-span-8 bg-white rounded-lg shadow p-4 flex flex-col h-full overflow-hidden relative">
+                        <div className="flex items-center justify-between mb-4">
+                            <h2 className="text-2xl font-bold text-gray-800 flex items-center">
+                                <span className="mr-2">📦</span> 仓库
+                            </h2>
+                            <div className="space-x-2">
+                                <input type="file" accept=".xlsx, .xls" ref={fileInputRef} className="hidden" onChange={handleFileUpload} />
+                                <button onClick={() => fileInputRef.current?.click()} className="px-3 py-1.5 bg-green-50 hover:bg-green-100 text-green-700 rounded border border-green-200 transition text-sm flex items-center inline-flex">
+                                    <FileSpreadsheet size={16} className="mr-1"/> 导入Excel
+                                </button>
+                                <button onClick={() => openEditModal()} className="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded border border-blue-200 transition text-sm flex items-center inline-flex">
+                                    <Plus size={16} className="mr-1"/> 手动添加
+                                </button>
+                            </div>
+                        </div>
+
+                        {stockFiles.length > 0 && (
+                            <div className="mb-4 bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden z-20 relative">
+                                <div className="bg-gray-50 px-4 py-2 border-b border-gray-200 flex justify-between items-center">
+                                    <h3 className="text-sm font-bold text-gray-700 flex items-center">
+                                        <FileSpreadsheet size={16} className="mr-2 text-blue-600"/> 已导入文件 ({stockFiles.length})
+                                    </h3>
+                                </div>
+                                <div className="max-h-40 overflow-y-auto">
+                                    <table className="min-w-full text-xs">
+                                        <thead className="bg-gray-50 sticky top-0">
+                                            <tr>
+                                                <th className="px-4 py-2 text-left text-gray-500 font-medium w-1/2">文件名</th>
+                                                <th className="px-4 py-2 text-center text-gray-500 font-medium">商品数</th>
+                                                <th className="px-4 py-2 text-right text-gray-500 font-medium">操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-gray-100">
+                                            {stockFiles.map(f => (
+                                                <tr key={f.id} className="hover:bg-blue-50">
+                                                    <td className="px-4 py-2 text-gray-700 font-medium">{f.name}</td>
+                                                    <td className="px-4 py-2 text-center text-gray-500">{f.data.length}</td>
+                                                    <td className="px-4 py-2 text-right">
+                                                        <button onClick={() => removeFile(f.id)} className="inline-flex items-center px-3 py-1 bg-red-50 text-red-600 hover:bg-red-100 rounded border border-transparent hover:border-red-200 transition-all font-medium">
+                                                            <Trash2 size={12} className="mr-1"/> 删除文件
+                                                        </button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="flex-1 overflow-auto border rounded-lg relative z-0">
+                            <table className="min-w-full divide-y divide-gray-200">
+                                <thead className="bg-gray-50 sticky top-0 z-10">
+                                    <tr>
+                                        <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">预览图</th>
+                                        <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">商品名称</th>
+                                        <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">单价</th>
+                                        <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">总库存</th>
+                                        <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase">剩余数量</th>
+                                        <th className="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase">操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="bg-white divide-y divide-gray-200">
+                                    {sortedProducts.map((product) => (
+                                        <tr key={product.id} className={product.remainingCount < 0 ? 'bg-gray-100' : 'hover:bg-gray-50'}>
+                                            <td className="px-3 py-2 whitespace-nowrap">
+                                                <div className="h-10 w-10 bg-gray-100 rounded flex items-center justify-center overflow-hidden border relative group">
+                                                    {product.imageUrl ? <img src={product.imageUrl} className="h-full w-full object-cover" /> : <ImageIcon size={16} className="text-gray-400" />}
+                                                    <label className="absolute inset-0 bg-black bg-opacity-0 group-hover:bg-opacity-30 flex items-center justify-center transition-all cursor-pointer">
+                                                        <input type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files && handleImageUpload(product.name, e.target.files[0])} />
+                                                        <Upload size={14} className="text-white opacity-0 group-hover:opacity-100" />
+                                                    </label>
+                                                </div>
+                                            </td>
+                                            <td className="px-3 py-2 text-sm font-medium text-gray-900">{product.name}</td>
+                                            <td className="px-3 py-2 text-sm text-gray-500">¥{product.price}</td>
+                                            <td className="px-3 py-2 text-sm text-gray-500">{product.totalStock}</td>
+                                            <td className={`px-3 py-2 text-sm font-bold ${product.remainingCount < 0 ? 'text-gray-400' : product.remainingCount < 10 ? 'text-red-600' : 'text-green-600'}`}>
+                                                {product.remainingCount}
+                                            </td>
+                                            <td className="px-3 py-2 text-center">
+                                                <button onClick={() => openEditModal(product)} className="text-gray-500 hover:text-blue-600 transition" title="编辑/修正">
+                                                    <Edit3 size={16} />
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                    {sortedProducts.length === 0 && (
+                                        <tr><td colSpan={6} className="px-6 py-10 text-center text-gray-400">暂无商品</td></tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <div className="col-span-4 bg-white rounded-lg shadow p-6 flex flex-col h-full overflow-y-auto">
+                        <h2 className="text-xl font-bold mb-6 text-gray-800">活动奖励申请</h2>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">渠道 <span className="text-red-500">*</span></label>
+                                <input type="text" className="w-full bg-white border border-gray-400 text-gray-900 rounded-md p-2" value={channel} onChange={(e) => setChannel(e.target.value)} />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">活动名称 <span className="text-red-500">*</span></label>
+                                <input type="text" className="w-full bg-white border border-gray-400 text-gray-900 rounded-md p-2" value={activityName} onChange={(e) => setActivityName(e.target.value)} />
+                            </div>
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-1">活动方案文档 <span className="text-red-500">*</span></label>
+                                <input type="text" placeholder="https://..." className="w-full bg-white border border-gray-400 text-gray-900 rounded-md p-2" value={docLink} onChange={(e) => setDocLink(e.target.value)} />
+                            </div>
+
+                            <div className="pt-2 border-t">
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-sm font-medium text-gray-700">申请奖励 <span className="text-red-500">*</span></label>
+                                    <label className="block text-sm font-medium text-gray-700 w-20">数量</label>
+                                </div>
+                                <div className="flex space-x-2 mb-2">
+                                    <div className="relative flex-1">
+                                        <input type="text" placeholder="搜索或选择商品..." className="w-full bg-white border border-gray-400 text-gray-900 p-2 rounded text-sm" value={rewardSearch} 
+                                            onChange={(e) => { setRewardSearch(e.target.value); setCurrentRewardId(''); }} 
+                                            onBlur={() => { setTimeout(() => { if (!currentRewardId && rewardSearch) { const exact = products.find(p => p.name === rewardSearch); if (exact) setCurrentRewardId(exact.id); } }, 200); }} 
+                                        />
+                                        {rewardSearch && !currentRewardId && (
+                                            <div className="absolute z-10 w-full bg-white border border-gray-300 rounded shadow-lg max-h-40 overflow-auto mt-1">
+                                                {filteredRewardOptions.map(p => (
+                                                    <div key={p.id} className="p-2 hover:bg-blue-50 cursor-pointer text-sm flex justify-between" onMouseDown={() => { setCurrentRewardId(p.id); setRewardSearch(p.name); }}>
+                                                        <span>{p.name}</span>
+                                                        <span className={p.remainingCount > 0 ? 'text-green-500' : 'text-red-500'}>余: {p.remainingCount}</span>
+                                                    </div>
+                                                ))}
+                                                {filteredRewardOptions.length === 0 && <div className="p-2 text-gray-500 text-sm">无匹配商品</div>}
+                                            </div>
+                                        )}
+                                    </div>
+                                    <input type="number" placeholder="1" className="w-20 bg-white border border-gray-400 text-gray-900 p-2 rounded text-sm" value={currentRewardQty} onChange={(e) => setCurrentRewardQty(Number(e.target.value))} />
+                                    <button onClick={handleAddReward} disabled={!currentRewardId} className="bg-blue-600 text-white p-2 rounded hover:bg-blue-700 disabled:bg-gray-300"><Plus size={16} /></button>
+                                </div>
+                                <div className="space-y-2 mt-4 max-h-40 overflow-y-auto min-h-[50px] bg-gray-50 rounded p-2 border border-dashed">
+                                    {selectedRewards.map((reward, idx) => (
+                                        <div key={idx} className="flex justify-between items-center bg-white border p-2 rounded text-sm shadow-sm">
+                                            <div className="truncate flex-1 font-medium">{reward.productName}</div>
+                                            <div className="w-16 text-right mr-4">x {reward.applyQty}</div>
+                                            <button onClick={() => removeReward(reward.productId)} className="text-red-500 hover:text-red-700"><Trash2 size={14} /></button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="pt-4 border-t">
+                                <div className="flex justify-between items-center mb-2">
+                                    <span className="font-bold text-gray-700">奖励总价值:</span>
+                                    <span className="text-xl font-bold text-blue-600">¥{calculateTotalValue().toLocaleString()}</span>
+                                </div>
+                                <button onClick={handleCopyValueTable} className="flex items-center text-xs text-gray-500 hover:text-blue-600 border px-2 py-1 rounded">
+                                    <Copy size={12} className="mr-1" /> 复制奖励价值表
+                                </button>
+                            </div>
+
+                            <div className="mt-auto pt-6">
+                                <button onClick={handleSubmitApplication} className="w-full bg-blue-600 text-white py-3 rounded-md hover:bg-blue-700 transition font-medium shadow-sm">提交</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const ProductMatchCell = ({ item, products, onMatch }) => {
+            const [isEditing, setIsEditing] = useState(false);
+            const [search, setSearch] = useState('');
+            const wrapperRef = useRef(null);
+            const inputRef = useRef(null);
+            const matchedProduct = products.find(p => p.id === item.matchedProductId);
+
+            useEffect(() => { if (isEditing && inputRef.current) inputRef.current.focus(); }, [isEditing]);
+            useEffect(() => {
+                const handleClickOutside = (event) => { if (wrapperRef.current && !wrapperRef.current.contains(event.target)) setIsEditing(false); };
+                document.addEventListener('mousedown', handleClickOutside);
+                return () => document.removeEventListener('mousedown', handleClickOutside);
+            }, []);
+
+            const filteredProducts = useMemo(() => {
+                if (!search) return products;
+                return products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()));
+            }, [products, search]);
+
+            if (isEditing) {
+                return (
+                    <div ref={wrapperRef} className="relative w-full">
+                        <input ref={inputRef} type="text" className="w-full border border-blue-500 rounded px-2 py-1 text-xs bg-white text-gray-900" placeholder="搜索..." value={search} onChange={(e) => setSearch(e.target.value)} />
+                        <div className="absolute top-full left-0 w-64 bg-white border border-gray-300 shadow-xl max-h-48 overflow-auto z-50 rounded-b mt-1">
+                            {filteredProducts.map(p => (
+                                <div key={p.id} className="px-3 py-2 hover:bg-blue-50 cursor-pointer text-xs border-b border-gray-50 flex justify-between" onClick={() => { onMatch(p.id); setIsEditing(false); setSearch(''); }}>
+                                    <span className="font-medium text-gray-700">{p.name}</span>
+                                    <span className={p.remainingCount > 0 ? 'text-green-600' : 'text-red-400'}>余: {p.remainingCount}</span>
+                                </div>
+                            ))}
+                            {filteredProducts.length === 0 && <div className="px-3 py-2 text-gray-400 text-xs text-center">无匹配</div>}
+                        </div>
+                    </div>
+                );
+            }
+            return (
+                <div onClick={() => { setIsEditing(true); setSearch(matchedProduct ? matchedProduct.name : ''); }} className={`cursor-pointer px-2 py-1 rounded border border-transparent hover:border-gray-300 hover:bg-gray-50 flex items-center justify-between min-h-[28px] ${!matchedProduct ? 'bg-red-50 text-red-600 font-medium' : 'text-gray-900'}`}>
+                    {matchedProduct ? <span>{matchedProduct.name}</span> : <span className="flex items-center text-xs"><AlertTriangle size={12} className="mr-1"/> 点击匹配</span>}
+                    <ChevronDown size={12} className="text-gray-400 opacity-0 group-hover:opacity-100" />
+                </div>
+            );
+        };
+
+        const DetailsTab = ({ applications, products, updateApplication, deleteApplication }) => {
+            const [filterType, setFilterType] = useState('all');
+            const [activitySearch, setActivitySearch] = useState('');
+            const [shipmentSearch, setShipmentSearch] = useState('');
+            const [selectedAppId, setSelectedAppId] = useState('');
+            const [formSearch, setFormSearch] = useState('');
+            const [previewData, setPreviewData] = useState([]);
+            const [expandedRows, setExpandedRows] = useState(new Set());
+            const [collapsedShipmentSections, setCollapsedShipmentSections] = useState(new Set());
+            const [editingItem, setEditingItem] = useState(null);
+
+            const toggleRow = (id) => { const next = new Set(expandedRows); if (next.has(id)) next.delete(id); else next.add(id); setExpandedRows(next); };
+            const toggleShipmentSection = (id) => { const next = new Set(collapsedShipmentSections); if (next.has(id)) next.delete(id); else next.add(id); setCollapsedShipmentSections(next); };
+
+            const handleFieldChange = (appId, field, value) => {
+                const app = applications.find(a => a.id === appId);
+                if (app) updateApplication({ ...app, [field]: value });
+            };
+
+            const handleRewardStatusChange = (appId, productId, newStatus) => {
+                const app = applications.find(a => a.id === appId);
+                if (!app) return;
+                const existingReward = app.rewards.find(r => r.productId === productId);
+                let newRewards;
+                if (existingReward) {
+                    newRewards = app.rewards.map(r => r.productId === productId ? { ...r, status: newStatus } : r);
+                } else {
+                    const product = products.find(p => p.id === productId);
+                    if (!product) return;
+                    const newReward = { productId: product.id, productName: product.name, price: product.price, applyQty: 0, status: newStatus, note: '' };
+                    newRewards = [...app.rewards, newReward];
+                }
+                updateApplication({ ...app, rewards: newRewards });
+            };
+
+            const handleRewardNoteChange = (appId, productId, note) => {
+                const app = applications.find(a => a.id === appId);
+                if (!app) return;
+                const existingReward = app.rewards.find(r => r.productId === productId);
+                let newRewards;
+                if (existingReward) {
+                    newRewards = app.rewards.map(r => r.productId === productId ? { ...r, note } : r);
+                } else {
+                    const product = products.find(p => p.id === productId);
+                    if (!product) return;
+                    const newReward = { productId: product.id, productName: product.name, price: product.price, applyQty: 0, status: 'unshipped', note: note };
+                    newRewards = [...app.rewards, newReward];
+                }
+                updateApplication({ ...app, rewards: newRewards });
+            };
+
+            const handlePaste = (e) => {
+                e.preventDefault();
+                const text = e.clipboardData.getData('text');
+                const parsed = parseShipmentPaste(text);
+                if (parsed.length > 0) setPreviewData(parsed);
+                else alert("未识别到有效数据");
+            };
+
+            const handleSubmitImport = () => {
+                if (!selectedAppId || previewData.length === 0) return;
+                const app = applications.find(a => a.id === selectedAppId);
+                if (!app) return;
+                const newShipmentDetails = previewData.map(item => {
+                    const normalizedRaw = (item.rawItemName || '').trim().toLowerCase();
+                    const match = products.find(p => p.name.trim() === item.rawItemName?.trim()) || products.find(p => p.name.trim().toLowerCase() === normalizedRaw);
+                    return {
+                        id: Math.random().toString(36).substr(2, 9),
+                        rawItemName: item.rawItemName || 'Unknown',
+                        matchedProductId: match ? match.id : null,
+                        quantity: item.quantity || 0,
+                        receiverName: item.receiverName || '',
+                        receiverPhone: item.receiverPhone || '',
+                        receiverAddress: item.receiverAddress || '',
+                        notes: item.notes || ''
+                    };
+                });
+                updateApplication({ ...app, shipmentDetails: [...app.shipmentDetails, ...newShipmentDetails] });
+                setSelectedAppId(''); setFormSearch(''); setPreviewData([]); alert('发货单导入成功');
+            };
+
+            const filteredApps = useMemo(() => {
+                return applications.filter(app => {
+                    if (activitySearch) {
+                        const k = activitySearch.toLowerCase();
+                        if (!app.activityName.toLowerCase().includes(k) && !app.channel.toLowerCase().includes(k)) return false;
+                    }
+                    const hasShipped = app.rewards.some(r => r.status === 'shipped');
+                    const hasUnshipped = app.rewards.some(r => !r.status || r.status === 'unshipped');
+                    if (filterType === 'shipped') return hasShipped;
+                    if (filterType === 'unshipped') return hasUnshipped;
+                    return true;
+                });
+            }, [applications, filterType, activitySearch]);
+
+            const shipmentMatches = useMemo(() => {
+                if (!shipmentSearch) return [];
+                const matches = [];
+                const k = shipmentSearch.toLowerCase();
+                applications.forEach(app => {
+                    app.shipmentDetails.forEach(item => {
+                        if (item.receiverName.toLowerCase().includes(k) || item.receiverPhone.includes(k) || item.receiverAddress.toLowerCase().includes(k) || item.rawItemName.toLowerCase().includes(k)) {
+                            matches.push({ app, item });
+                        }
+                    })
+                });
+                return matches;
+            }, [applications, shipmentSearch]);
+
+            const handleViewActivity = (app) => {
+                setShipmentSearch('');
+                setActivitySearch(app.activityName); 
+                setExpandedRows(new Set([app.id])); 
+                setCollapsedShipmentSections(prev => { const next = new Set(prev); next.delete(app.id); return next; });
+            };
+
+            const saveEditItem = () => {
+                if (!editingItem) return;
+                const { appId, item } = editingItem;
+                const app = applications.find(a => a.id === appId);
+                if (!app) return;
+                const updatedDetails = app.shipmentDetails.map(d => d.id === item.id ? item : d);
+                updateApplication({ ...app, shipmentDetails: updatedDetails });
+                setEditingItem(null);
+            };
+
+            return (
+                <div className="grid grid-cols-12 gap-6 h-full relative">
+                    {editingItem && (
+                        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center">
+                            <div className="bg-white rounded-lg p-6 w-[600px] shadow-xl max-h-[90vh] overflow-y-auto">
+                                <h3 className="text-lg font-bold mb-4">编辑发货信息</h3>
+                                <div className="space-y-4">
+                                    <input type="text" className="w-full border p-2 rounded bg-white text-gray-900" value={editingItem.item.rawItemName} onChange={(e) => setEditingItem({...editingItem, item: {...editingItem.item, rawItemName: e.target.value}})} placeholder="原始物品名称" />
+                                    <div className="grid grid-cols-3 gap-4">
+                                        <input type="number" className="w-full border p-2 rounded bg-white text-gray-900" value={editingItem.item.quantity} onChange={(e) => setEditingItem({...editingItem, item: {...editingItem.item, quantity: parseInt(e.target.value)||0}})} placeholder="数量" />
+                                        <input type="text" className="w-full border p-2 rounded bg-white text-gray-900" value={editingItem.item.receiverName} onChange={(e) => setEditingItem({...editingItem, item: {...editingItem.item, receiverName: e.target.value}})} placeholder="收件人" />
+                                        <input type="text" className="w-full border p-2 rounded bg-white text-gray-900" value={editingItem.item.receiverPhone} onChange={(e) => setEditingItem({...editingItem, item: {...editingItem.item, receiverPhone: e.target.value}})} placeholder="电话" />
+                                    </div>
+                                    <input type="text" className="w-full border p-2 rounded bg-white text-gray-900" value={editingItem.item.receiverAddress} onChange={(e) => setEditingItem({...editingItem, item: {...editingItem.item, receiverAddress: e.target.value}})} placeholder="地址" />
+                                    <input type="text" className="w-full border p-2 rounded bg-white text-gray-900" value={editingItem.item.notes} onChange={(e) => setEditingItem({...editingItem, item: {...editingItem.item, notes: e.target.value}})} placeholder="备注" />
+                                </div>
+                                <div className="flex justify-end mt-6 space-x-2">
+                                    <button onClick={() => setEditingItem(null)} className="px-4 py-2 border rounded hover:bg-gray-100 bg-white text-gray-700">取消</button>
+                                    <button onClick={saveEditItem} className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">保存</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    <div className="col-span-8 bg-white rounded-lg shadow p-4 flex flex-col h-full overflow-hidden">
+                        <div className="flex flex-col space-y-3 mb-4 border-b pb-4">
+                            <div className="flex items-center justify-between">
+                                <h2 className="text-2xl font-bold text-gray-800">活动发货详情</h2>
+                                {!shipmentSearch && (
+                                    <div className="flex rounded-md bg-gray-100 p-1">
+                                        {['all','shipped','unshipped'].map(t => (
+                                            <button key={t} onClick={() => setFilterType(t)} className={`px-3 py-1 text-sm rounded ${filterType === t ? 'bg-white shadow text-blue-600' : 'text-gray-500'}`}>
+                                                {t==='all'?'全部':t==='shipped'?'已发货':'未发货'}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="relative">
+                                    <div className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 pointer-events-none"><Box size={14}/></div>
+                                    <input type="text" placeholder="检索活动..." className="w-full pl-9 pr-4 py-2 border rounded-md text-sm bg-white text-gray-900 disabled:bg-gray-100" value={activitySearch} onChange={(e) => setActivitySearch(e.target.value)} disabled={!!shipmentSearch}/>
+                                </div>
+                                <div className="relative">
+                                    <div className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400 pointer-events-none"><Truck size={14}/></div>
+                                    <input type="text" placeholder="检索发货信息..." className="w-full pl-9 pr-4 py-2 border rounded-md text-sm bg-white text-gray-900" value={shipmentSearch} onChange={(e) => setShipmentSearch(e.target.value)}/>
+                                </div>
+                            </div>
+                        </div>
+
+                        {shipmentSearch ? (
+                            <div className="flex-1 overflow-auto">
+                                <div className="mb-2 text-sm text-gray-600 font-bold px-1">搜索结果 ({shipmentMatches.length})</div>
+                                {shipmentMatches.length === 0 ? <div className="text-center py-10 text-gray-400">未找到</div> : (
+                                    <table className="min-w-full text-xs">
+                                        <thead className="bg-gray-100"><tr><th className="px-3 py-2 text-left">活动</th><th className="px-3 py-2 text-left">物品</th><th className="px-3 py-2">数量</th><th className="px-3 py-2 text-left">收件人</th><th className="px-3 py-2">电话</th><th className="px-3 py-2 text-left">地址</th><th className="px-3 py-2">操作</th></tr></thead>
+                                        <tbody className="bg-white">
+                                            {shipmentMatches.map((match, idx) => (
+                                                <tr key={idx} className="hover:bg-blue-50">
+                                                    <td className="px-3 py-2 font-medium">{match.app.activityName}</td>
+                                                    <td className="px-3 py-2 text-gray-600">{match.item.rawItemName}</td>
+                                                    <td className="px-3 py-2 text-center">{match.item.quantity}</td>
+                                                    <td className="px-3 py-2">{match.item.receiverName}</td>
+                                                    <td className="px-3 py-2">{match.item.receiverPhone}</td>
+                                                    <td className="px-3 py-2 truncate max-w-[150px]">{match.item.receiverAddress}</td>
+                                                    <td className="px-3 py-2 text-center">
+                                                        <button onClick={() => handleViewActivity(match.app)} className="inline-flex items-center px-2 py-1 bg-blue-100 text-blue-700 rounded text-xs font-medium"><Eye size={12} className="mr-1"/> 查看</button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                            </div>
+                        ) : (
+                            <div className="flex-1 overflow-auto">
+                                <div className="grid grid-cols-12 gap-2 px-3 py-2 bg-gray-100 text-xs font-bold text-gray-600 rounded-t-lg uppercase mb-1">
+                                    <div className="col-span-1 text-center">展开</div><div className="col-span-2">渠道</div><div className="col-span-3">活动名称</div><div className="col-span-1">方案</div><div className="col-span-2">出库单号</div><div className="col-span-2">快递单号</div><div className="col-span-1 text-right">操作</div>
+                                </div>
+                                {filteredApps.map(app => {
+                                    const hasShipped = app.rewards.some(r => r.status === 'shipped');
+                                    const hasUnshipped = app.rewards.some(r => !r.status || r.status === 'unshipped');
+                                    const isPartiallyShipped = hasShipped && hasUnshipped;
+                                    const isExpanded = expandedRows.has(app.id);
+                                    
+                                    const shippedStats = new Map();
+                                    app.shipmentDetails.forEach(item => { if (item.matchedProductId) shippedStats.set(item.matchedProductId, (shippedStats.get(item.matchedProductId) || 0) + item.quantity); });
+                                    const allProductIds = new Set([...app.rewards.map(r => r.productId), ...Array.from(shippedStats.keys())]);
+
+                                    return (
+                                        <div key={app.id} className={`mb-4 border rounded-lg ${hasShipped ? 'border-green-200 bg-green-50' : 'border-gray-200'}`}>
+                                            <div className="p-3 grid grid-cols-12 gap-2 items-center text-sm">
+                                                <div className="col-span-1 text-center"><button onClick={() => toggleRow(app.id)} className="text-gray-500 hover:text-gray-700">{isExpanded ? <ChevronUp size={18} /> : <ChevronDown size={18} />}</button></div>
+                                                <div className="col-span-2 font-medium truncate">{app.channel}</div>
+                                                <div className="col-span-3 font-medium truncate flex items-center">
+                                                    <span className="truncate">{app.activityName}</span>
+                                                    {isPartiallyShipped && <span className="ml-2 px-1 py-0.5 rounded text-[10px] bg-orange-100 text-orange-800 border border-orange-200 whitespace-nowrap">只发了部分</span>}
+                                                </div>
+                                                <div className="col-span-1 text-blue-600 truncate"><a href={app.docLink} target="_blank" className="underline">查看</a></div>
+                                                <div className="col-span-2"><input type="text" className={`w-full border rounded px-2 py-1 text-xs ${hasShipped ? 'bg-white border-green-300' : 'bg-white'}`} value={app.outboundOrderNo} onChange={(e) => handleFieldChange(app.id, 'outboundOrderNo', e.target.value)} placeholder="单号"/></div>
+                                                <div className="col-span-2"><input type="text" className="w-full border rounded px-2 py-1 text-xs bg-white" value={app.trackingNo||''} onChange={(e) => handleFieldChange(app.id, 'trackingNo', e.target.value)} placeholder="快递"/></div>
+                                                <div className="col-span-1 text-right"><button onClick={(e) => deleteApplication(app.id)} className="text-gray-300 hover:text-red-600 p-1"><Trash2 size={16}/></button></div>
+                                            </div>
+                                            {isExpanded && (
+                                                <div className="border-t border-gray-200 p-4 bg-white rounded-b-lg">
+                                                    <div className="mb-4">
+                                                        <h4 className="text-xs font-bold text-gray-500 uppercase mb-2">奖励明细</h4>
+                                                        <table className="min-w-full text-xs border">
+                                                            <thead className="bg-gray-50"><tr><th className="px-2 py-1 border text-left">商品</th><th className="px-2 py-1 border text-center">申请</th><th className="px-2 py-1 border text-center">实发</th><th className="px-2 py-1 border text-center">状态</th><th className="px-2 py-1 border text-left">备注</th></tr></thead>
+                                                            <tbody>
+                                                                {Array.from(allProductIds).map(pid => {
+                                                                    const applied = app.rewards.find(r => r.productId === pid);
+                                                                    const shippedQty = shippedStats.get(pid) || 0;
+                                                                    const product = products.find(p => p.id === pid);
+                                                                    const productName = product ? product.name : (applied ? applied.productName : pid); 
+                                                                    const applyQty = applied ? applied.applyQty : 0;
+                                                                    const isExtra = !applied; 
+                                                                    const isShort = shippedQty < applyQty;
+                                                                    
+                                                                    let badge = null;
+                                                                    if (isExtra) badge = <span className="bg-red-100 text-red-800 px-1 rounded ml-2 border border-red-200">非申请项</span>;
+                                                                    else if (isShort) badge = <span className="bg-orange-100 text-orange-800 px-1 rounded ml-2">少发</span>;
+                                                                    else if (shippedQty > applyQty) badge = <span className="bg-blue-100 text-blue-800 px-1 rounded ml-2">多发</span>;
+                                                                    else badge = <span className="bg-green-100 text-green-800 px-1 rounded ml-2">匹配</span>;
+
+                                                                    return (
+                                                                        <tr key={pid} className={isExtra ? 'bg-red-50' : ''}>
+                                                                            <td className={`px-2 py-1 border ${isExtra ? 'text-red-600 font-bold' : 'text-gray-900'}`}>{productName} {badge}</td>
+                                                                            <td className="px-2 py-1 border text-center">{applyQty > 0 ? applyQty : '-'}</td>
+                                                                            <td className={`px-2 py-1 border text-center ${isShort && !isExtra ? 'text-red-600 font-bold' : 'text-green-600'}`}>{shippedQty}</td>
+                                                                            <td className="px-2 py-1 border text-center">
+                                                                                <select value={applied ? (applied.status || 'unshipped') : 'unshipped'} onChange={(e) => handleRewardStatusChange(app.id, pid, e.target.value)} className={`border rounded px-1 py-0.5 text-xs bg-white ${applied?.status === 'shipped' ? 'text-green-700 bg-green-50' : 'text-gray-600'}`}>
+                                                                                    <option value="unshipped">未发货</option><option value="shipped">已发货</option>
+                                                                                </select>
+                                                                            </td>
+                                                                            <td className="px-2 py-1 border"><input type="text" className={`w-full border rounded px-1 py-0.5 text-xs ${applied?.note ? 'bg-orange-100' : 'bg-white'}`} value={applied?.note || ''} onChange={(e) => handleRewardNoteChange(app.id, pid, e.target.value)} placeholder="备注..." /></td>
+                                                                        </tr>
+                                                                    );
+                                                                })}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                    <div>
+                                                        <div className="flex items-center justify-between mb-2">
+                                                            <h4 className="text-xs font-bold text-gray-500 uppercase flex items-center cursor-pointer" onClick={() => toggleShipmentSection(app.id)}>
+                                                                {collapsedShipmentSections.has(app.id) ? <ChevronDown size={14} className="mr-1"/> : <ChevronUp size={14} className="mr-1"/>} 发货单信息
+                                                            </h4>
+                                                            <button onClick={() => {let t="原始\t数量\t收件\t电话\t地址\t备注\n";app.shipmentDetails.forEach(i=>{t+=`${i.rawItemName}\t${i.quantity}\t${i.receiverName}\t${i.receiverPhone}\t${i.receiverAddress}\t${i.notes}\n`});copyToClipboard(t);}} className="text-xs text-blue-600 border px-2 py-1 rounded">复制信息</button>
+                                                        </div>
+                                                        {!collapsedShipmentSections.has(app.id) && (
+                                                            <table className="min-w-full text-xs border">
+                                                                <thead className="bg-gray-50"><tr><th className="px-2 py-1 border">原始名</th><th className="px-2 py-1 border w-48">匹配</th><th className="px-2 py-1 border">数量</th><th className="px-2 py-1 border">收件人</th><th className="px-2 py-1 border">电话</th><th className="px-2 py-1 border">地址</th><th className="px-2 py-1 border">备注</th><th className="px-2 py-1 border">操作</th></tr></thead>
+                                                                <tbody>
+                                                                    {app.shipmentDetails.map(item => (
+                                                                        <tr key={item.id} className={!item.matchedProductId ? 'bg-red-50' : ''}>
+                                                                            <td className="px-2 py-1 border">{item.rawItemName}</td>
+                                                                            <td className="px-2 py-1 border relative group"><ProductMatchCell item={item} products={products} onMatch={(pid) => { const u=app.shipmentDetails.map(d=>d.id===item.id?{...d,matchedProductId:pid}:d); updateApplication({...app,shipmentDetails:u}); }} /></td>
+                                                                            <td className="px-2 py-1 border text-center">{item.quantity}</td>
+                                                                            <td className="px-2 py-1 border">{item.receiverName}</td>
+                                                                            <td className="px-2 py-1 border">{item.receiverPhone}</td>
+                                                                            <td className="px-2 py-1 border truncate max-w-xs">{item.receiverAddress}</td>
+                                                                            <td className="px-2 py-1 border">{item.notes}</td>
+                                                                            <td className="px-2 py-1 border text-center">
+                                                                                <button onClick={() => setEditingItem({appId:app.id, item:{...item}})} className="text-blue-600 mr-2"><Edit2 size={14}/></button>
+                                                                                <button onClick={() => { if(confirm('删除?')) updateApplication({...app,shipmentDetails:app.shipmentDetails.filter(d=>d.id!==item.id)}) }} className="text-red-500"><Trash2 size={14}/></button>
+                                                                            </td>
+                                                                        </tr>
+                                                                    ))}
+                                                                </tbody>
+                                                            </table>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                    <div className="col-span-4 bg-white rounded-lg shadow p-6 flex flex-col h-full">
+                        <h2 className="text-xl font-bold mb-6 text-gray-800">我要发货</h2>
+                        <div className="space-y-6 flex-1 flex flex-col">
+                            <div>
+                                <label className="block text-sm font-medium text-gray-700 mb-2">选择活动</label>
+                                <div className="relative">
+                                    <input type="text" placeholder="搜索活动..." className="w-full border p-2 rounded text-sm bg-white text-gray-900" value={selectedAppId ? (applications.find(a => a.id === selectedAppId)?.activityName || '') : formSearch} onChange={(e) => { setFormSearch(e.target.value); setSelectedAppId(''); }} />
+                                    {!selectedAppId && formSearch && (
+                                        <div className="absolute w-full bg-white border mt-1 shadow-lg z-10 max-h-40 overflow-auto">
+                                            {applications.filter(a=>a.activityName.toLowerCase().includes(formSearch.toLowerCase())).map(app => (
+                                                <div key={app.id} className="p-2 hover:bg-gray-100 cursor-pointer text-sm" onClick={() => { setSelectedAppId(app.id); setFormSearch(''); }}>{app.activityName}</div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="flex-1 flex flex-col min-h-0">
+                                <label className="block text-sm font-medium text-gray-700 mb-2">粘贴发货单 (Ctrl+V)</label>
+                                <div className="flex-1 border-2 border-dashed border-gray-300 rounded overflow-auto bg-gray-50 relative" tabIndex={0} onPaste={handlePaste}>
+                                    {previewData.length === 0 ? <div className="p-10 text-center text-gray-400">点击此处粘贴Excel数据</div> : (
+                                        <table className="min-w-full text-xs text-left"><thead className="bg-gray-100 sticky top-0"><tr><th className="p-2 border">物品</th><th className="p-2 border">数量</th><th className="p-2 border">收件人</th><th className="p-2 border">电话</th><th className="p-2 border">地址</th></tr></thead><tbody className="bg-white">{previewData.map((row,i)=><tr key={i}><td className="p-2 border">{row.rawItemName}</td><td className="p-2 border">{row.quantity}</td><td className="p-2 border">{row.receiverName}</td><td className="p-2 border">{row.receiverPhone}</td><td className="p-2 border">{row.receiverAddress}</td></tr>)}</tbody></table>
+                                    )}
+                                </div>
+                                {previewData.length > 0 && <button onClick={() => setPreviewData([])} className="text-xs text-red-500 mt-2">清空</button>}
+                            </div>
+                            <button onClick={handleSubmitImport} disabled={!selectedAppId || previewData.length === 0} className="w-full bg-blue-600 text-white py-3 rounded disabled:bg-gray-300">确认导入</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const STORAGE_KEY = 'wsm_state_v1';
+
+            const loadPersistedState = () => {
+                try {
+                    const raw = localStorage.getItem(STORAGE_KEY);
+                    if (!raw) return null;
+                    const parsed = JSON.parse(raw);
+                    return (parsed && typeof parsed === 'object') ? parsed : null;
+                } catch (e) {
+                    console.warn('读取本地数据失败', e);
+                    return null;
+                }
+            };
+
+            const persisted = useMemo(() => loadPersistedState(), []);
+            const [activeTab, setActiveTab] = useState(persisted?.activeTab || 'warehouse');
+            const [stockFiles, setStockFiles] = useState(Array.isArray(persisted?.stockFiles) ? persisted.stockFiles : []);
+            const [manualAdjustments, setManualAdjustments] = useState(Array.isArray(persisted?.manualAdjustments) ? persisted.manualAdjustments : []);
+            const [productRenames, setProductRenames] = useState((persisted?.productRenames && typeof persisted.productRenames === 'object') ? persisted.productRenames : {});
+            const [applications, setApplications] = useState(Array.isArray(persisted?.applications) ? persisted.applications : []);
+
+            const importFileRef = useRef(null);
+
+            const buildState = () => ({
+                version: 1,
+                savedAt: Date.now(),
+                activeTab,
+                stockFiles,
+                manualAdjustments,
+                productRenames,
+                applications,
+            });
+
+            const persistState = (state) => {
+                try {
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+                } catch (e) {
+                    console.warn('保存本地数据失败（可能是数据太大）', e);
+                }
+            };
+
+            useEffect(() => {
+                persistState(buildState());
+            }, [activeTab, stockFiles, manualAdjustments, productRenames, applications]);
+
+            const handleExportData = () => {
+                const data = buildState();
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `warehouse_manager_backup_${new Date().toISOString().slice(0, 10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            };
+
+            const handleImportData = async (e) => {
+                const file = e.target.files && e.target.files[0];
+                if (!file) return;
+                try {
+                    const raw = await file.text();
+                    const parsed = JSON.parse(raw);
+                    if (!parsed || typeof parsed !== 'object') throw new Error('Invalid JSON');
+
+                    const nextState = {
+                        version: 1,
+                        savedAt: Date.now(),
+                        activeTab: parsed.activeTab || 'warehouse',
+                        stockFiles: Array.isArray(parsed.stockFiles) ? parsed.stockFiles : [],
+                        manualAdjustments: Array.isArray(parsed.manualAdjustments) ? parsed.manualAdjustments : [],
+                        productRenames: (parsed.productRenames && typeof parsed.productRenames === 'object') ? parsed.productRenames : {},
+                        applications: Array.isArray(parsed.applications) ? parsed.applications : [],
+                    };
+
+                    setActiveTab(nextState.activeTab);
+                    setStockFiles(nextState.stockFiles);
+                    setManualAdjustments(nextState.manualAdjustments);
+                    setProductRenames(nextState.productRenames);
+                    setApplications(nextState.applications);
+
+                    persistState(nextState);
+                    alert('导入成功（已覆盖当前数据）');
+                } catch (err) {
+                    console.error(err);
+                    alert('导入失败：请确认选择的是“导出”生成的 JSON 备份文件');
+                } finally {
+                    if (importFileRef.current) importFileRef.current.value = '';
+                }
+            };
+
+            const handleClearLocal = () => {
+                if (!window.confirm('确定清空本地数据吗？清空后无法恢复（除非你有导出的备份文件）。')) return;
+                setActiveTab('warehouse');
+                setStockFiles([]);
+                setManualAdjustments([]);
+                setProductRenames({});
+                setApplications([]);
+                try { localStorage.removeItem(STORAGE_KEY); } catch {}
+            };
+
+            const products = useMemo(() => {
+                const productMap = new Map();
+                const resolveName = (rawName) => productRenames[rawName] || rawName;
+
+                stockFiles.forEach(file => {
+                    file.data.forEach(row => {
+                        const key = resolveName(row.name);
+                        if (productMap.has(key)) {
+                            const existing = productMap.get(key);
+                            existing.totalStock += row.totalStock;
+                            existing.shippedCount += row.shippedCount;
+                            existing.remainingCount += row.remainingCount;
+                            if (row.price > 0) existing.price = row.price;
+                        } else {
+                            productMap.set(key, { id: key, name: key, price: row.price, totalStock: row.totalStock, shippedCount: row.shippedCount, remainingCount: row.remainingCount });
+                        }
+                    });
+                });
+
+                manualAdjustments.forEach(adj => {
+                    const key = adj.name;
+                    if (productMap.has(key)) {
+                        const existing = productMap.get(key);
+                        existing.totalStock += adj.totalStockOffset;
+                        existing.remainingCount += adj.remainingCountOffset;
+                        if (adj.price !== undefined) existing.price = adj.price;
+                        if (adj.imageUrl) existing.imageUrl = adj.imageUrl;
+                    } else {
+                        productMap.set(key, { id: key, name: key, price: adj.price || 0, totalStock: adj.totalStockOffset, shippedCount: 0, remainingCount: adj.remainingCountOffset, imageUrl: adj.imageUrl });
+                    }
+                });
+
+                const committedStock = new Map();
+                applications.forEach(app => {
+                    const appShippedMap = new Map();
+                    app.shipmentDetails.forEach(item => {
+                        if (item.matchedProductId) appShippedMap.set(item.matchedProductId, (appShippedMap.get(item.matchedProductId) || 0) + item.quantity);
+                    });
+                    app.rewards.forEach(r => {
+                        const productId = r.productId;
+                        const currentUsed = committedStock.get(productId) || 0;
+                        const deduction = r.status === 'shipped' ? (appShippedMap.get(productId) || 0) : r.applyQty;
+                        committedStock.set(productId, currentUsed + deduction);
+                    });
+                });
+
+                for (const [key, p] of productMap.entries()) {
+                    const used = committedStock.get(p.id) || 0;
+                    p.remainingCount -= used;
+                }
+                return Array.from(productMap.values());
+            }, [stockFiles, manualAdjustments, productRenames, applications]);
+
+            const handleProductRename = (oldName, newName) => {
+                if (oldName === newName) return;
+                setProductRenames(prev => { const next = { ...prev }; for (const k in next) if (next[k] === oldName) next[k] = newName; next[oldName] = newName; return next; });
+                setManualAdjustments(prev => prev.map(adj => adj.name === oldName ? { ...adj, name: newName } : adj));
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col bg-gray-100">
+                    <div className="bg-white shadow-sm border-b">
+                        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+                            <div className="flex space-x-8 h-16 items-center">
+                                <div className="text-xl font-bold text-gray-900 mr-4">仓库发货管理</div>
+                                <nav className="flex space-x-4">
+                                    <button onClick={() => setActiveTab('warehouse')} className={`px-3 py-2 rounded-md text-sm font-medium ${activeTab === 'warehouse' ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-200'}`}>仓库</button>
+                                    <button onClick={() => setActiveTab('details')} className={`px-3 py-2 rounded-md text-sm font-medium ${activeTab === 'details' ? 'bg-gray-900 text-white' : 'text-gray-500 hover:text-gray-700 hover:bg-gray-200'}`}>详情</button>
+                                </nav>
+                                <input ref={importFileRef} type="file" accept="application/json" className="hidden" onChange={handleImportData} />
+                                <div className="ml-auto flex items-center space-x-2">
+                                    <button onClick={handleExportData} className="px-3 py-1.5 bg-gray-900 text-white rounded-md text-sm hover:bg-gray-800">导出</button>
+                                    <button onClick={() => importFileRef.current?.click()} className="px-3 py-1.5 bg-white border border-gray-300 rounded-md text-sm hover:bg-gray-50">导入</button>
+                                    <button onClick={handleClearLocal} className="px-3 py-1.5 bg-red-50 text-red-600 rounded-md text-sm hover:bg-red-100">清空</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <main className="flex-1 max-w-[1600px] w-full mx-auto p-6 overflow-hidden h-[calc(100vh-64px)]">
+                        {activeTab === 'warehouse' ? (
+                            <WarehouseTab products={products} stockFiles={stockFiles} setStockFiles={setStockFiles} manualAdjustments={manualAdjustments} setManualAdjustments={setManualAdjustments} addApplication={(a) => setApplications(p => [a,...p])} onRenameProduct={handleProductRename} />
+                        ) : (
+                            <DetailsTab applications={applications} products={products} updateApplication={(u) => setApplications(p => p.map(a => a.id === u.id ? u : a))} deleteApplication={(id) => {if(confirm('删除?'))setApplications(p=>p.filter(a=>a.id!==id))}} />
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
